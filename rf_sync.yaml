@@ -1,0 +1,301 @@
+name: RF → ECR Image Sync
+
+# ── Triggers ────────────────────────────────────────────────────────────────────
+on:
+  schedule:
+    - cron: '0 12 * * 1'   # Weekly on Monday at 12:00 UTC
+
+  workflow_dispatch:        # Manual run from the Actions tab
+    inputs:
+      images:
+        description: |
+          JSON image list override. Leave blank to use the RF_IMAGES_TO_SYNC repo variable.
+          Format: [{"image":"rfal","ecr_repo":"rfcurated","tags":["al23-rfcurated","al23-fips-rfcurated"]}]
+          Only the tags listed are synced — there is no "sync everything" mode,
+          by design, so the catalogue stays a deliberate, curated list.
+        required: false
+        type: string
+
+# Prevent concurrent syncs — if a run is already in progress, cancel it
+# before starting a new one (e.g. two manual triggers in quick succession).
+concurrency:
+  group: rf-image-sync
+  cancel-in-progress: false
+
+env:
+  CRANE_VERSION: "0.20.2"
+  SOURCE_REGISTRY: "quay.io/rfcurated"
+  RF_ROOT_URL: "https://us01.rapidfort.com"
+  ECR_REGISTRY: "<account_id>.dkr.ecr.us-east-1.amazonaws.com"
+  AWS_REGION: "us-east-1"
+
+# ── Required repo configuration ─────────────────────────────────────────────────
+# Variables  (Settings → Secrets and variables → Actions → Variables):
+#   RF_IMAGES_TO_SYNC   JSON array — see format in workflow_dispatch input description.
+#                       "ecr_repo" is the destination repo/path under ECR. "tags" is
+#                       an explicit list of exact quay.io tags to sync for that image —
+#                       there is no tag auto-discovery, so the catalogue only ever
+#                       syncs what's deliberately listed (e.g. standard + FIPS/STIG
+#                       variants you've actually chosen), not every tag RapidFort
+#                       has ever published for that image.
+#
+# Secrets  (Settings → Secrets and variables → Actions → Secrets):
+#   RF_ACCESS_ID           RapidFort access ID
+#   RF_SECRET_ACCESS_KEY   RapidFort secret access key
+#   (both are used only to mint short-lived quay.io pull credentials via the
+#    docker-credential-rfcurated helper — no static quay.io password is stored)
+#
+# AWS auth: unchanged from the previous version of this pipeline — the runner's
+# existing AWS credentials are used directly via `aws ecr get-login-password`
+# (no OIDC role-assumption step added here).
+#
+# Parallelism: each catalogue image runs as its own matrix job (its own runner,
+# its own crane install, its own fresh quay.io token) — see max-parallel below.
+# True concurrency is still capped by how many runners exist;
+# with only one registered runner, matrix legs will queue rather than overlap.
+# ────────────────────────────────────────────────────────────────────────────────
+
+jobs:
+  load-catalogue:
+    name: Load image catalogue
+    runs-on: [ubuntu-latest]
+    # RF_IMAGES_TO_SYNC is bound to the "RF_IMAGES_TO_SYNC" GitHub Environment
+    # (Settings → Environments) rather than a repo-level variable — this job must
+    # declare that environment to read it via vars.RF_IMAGES_TO_SYNC. The sync
+    # job below doesn't need it — it only consumes this job's output.
+    environment: RF_IMAGES_TO_SYNC
+    outputs:
+      images: ${{ steps.load.outputs.images }}
+    steps:
+      - name: Resolve RF_IMAGES_TO_SYNC
+        id: load
+        env:
+          IMAGES: ${{ inputs.images || vars.RF_IMAGES_TO_SYNC }}
+        run: |
+          if [ -z "$IMAGES" ]; then
+            echo "::error::IMAGES is empty. Set the RF_IMAGES_TO_SYNC repo variable"
+            echo "::error::(Settings → Secrets and variables → Actions → Variables)"
+            echo "::error::to a JSON array, e.g. [{\"image\":\"rfal\",\"ecr_repo\":\"rfcurated\",\"tags\":[\"al23-rfcurated\"]}],"
+            echo "::error::or pass an override via the 'images' workflow_dispatch input."
+            exit 1
+          fi
+          if ! echo "$IMAGES" | jq -e . >/dev/null 2>&1; then
+            echo "::error::IMAGES is not valid JSON: $IMAGES"
+            exit 1
+          fi
+          echo "images=$(echo "$IMAGES" | jq -c .)" >> "$GITHUB_OUTPUT"
+
+  sync:
+    name: Sync ${{ matrix.image }}
+    needs: load-catalogue
+    runs-on: [ubuntu-latest]
+    strategy:
+      fail-fast: false   # one image failing shouldn't cancel the rest
+      max-parallel: 4     # cap simultaneous quay.io pulls — raise if your RF/quay quota allows it
+      matrix:
+        include: ${{ fromJson(needs.load-catalogue.outputs.images) }}
+    # Job-level (not step-level) so the later "Sync" step's refresh_quay_auth()
+    # can re-authenticate too — GH Actions step `env:` doesn't carry over to
+    # subsequent steps, and docker-credential-rfcurated needs these on every
+    # call that mints a fresh token, not just the first one.
+    env:
+      RF_ACCESS_ID: ${{ secrets.RF_ACCESS_ID }}
+      RF_SECRET_ACCESS_KEY: ${{ secrets.RF_SECRET_ACCESS_KEY }}
+
+    steps:
+      # ── Install crane ─────────────────────────────────────────────────────────
+
+      - name: Install crane ${{ env.CRANE_VERSION }}
+        run: |
+          curl -fsSL \
+            "https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
+            -o /tmp/crane.tar.gz
+          sudo tar -xzf /tmp/crane.tar.gz -C /usr/local/bin crane
+          crane version
+
+      # ── AWS auth (same as previous version — runner's existing AWS credentials) ──
+
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password --region "$AWS_REGION" | crane auth login "$ECR_REGISTRY" --username AWS --password-stdin
+
+      # RapidFort's credential helper exchanges RF_ACCESS_ID / RF_SECRET_ACCESS_KEY
+      # for short-lived quay.io pull credentials, which crane then authenticates with.
+      - name: Authenticate crane to quay.io via RapidFort
+        run: |
+          curl -sO "${RF_ROOT_URL}/cli/docker-credential-rfcurated-$(uname)-$(uname -m).tar.gz"
+          sudo tar xzf "docker-credential-rfcurated-$(uname)-$(uname -m).tar.gz" -C /usr/local/bin
+          docker-credential-rfcurated --version
+
+          echo quay.io | docker-credential-rfcurated init
+          creds=$(echo quay.io | docker-credential-rfcurated get)
+          username=$(echo "$creds" | jq -r '.Username')
+          password=$(echo "$creds" | jq -r '.Secret')
+          crane auth login quay.io --username "$username" --password-stdin <<< "$password"
+          echo "crane logged into quay.io"
+
+      # ── Sync this matrix leg's image ─────────────────────────────────────────
+
+      - name: Sync ${{ matrix.image }}
+        id: sync
+        env:
+          IMAGE: ${{ matrix.image }}
+          ECR_REPO: ${{ matrix.ecr_repo }}
+          TAGS: ${{ toJson(matrix.tags) }}
+        run: |
+          python3 <<'EOF'
+          import datetime, json, os, re, subprocess, sys
+
+          name      = os.environ["IMAGE"]           # e.g. "rfal", "envoyproxy/envoy"
+          ecr_repo  = os.environ["ECR_REPO"]
+          # Explicit tag list ONLY — no crane-ls/auto-discovery. A single catalogue
+          # image can carry hundreds of published *-rfcurated tags across OS,
+          # version, and FIPS/STIG combinations; syncing "all of them" is how a
+          # handful of catalogue entries turned into 3,000+ synced images last run.
+          # Every tag actually mirrored is one deliberately listed here.
+          tags      = json.loads(os.environ["TAGS"])
+          registry  = os.environ["ECR_REGISTRY"]
+          source    = os.environ["SOURCE_REGISTRY"]
+          # UTC datestamp (YYYYMMDD) — the date this image is mirrored into ECR.
+          datestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d")
+          copied = skipped = failed = 0
+          rows = []
+
+          if not tags:
+              print(f"::error::No tags listed for {name} — add a non-empty \"tags\" array to its catalogue entry")
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write(f"## RapidFort Curated → ECR Image Sync: {name}\n")
+                  f.write(f"❌ no tags listed in catalogue entry\n")
+              sys.exit(1)
+
+          def crane(*args):
+              return subprocess.run(["crane", *args], capture_output=True, text=True)
+
+          # The RapidFort-issued quay.io credential is short-lived. Refresh
+          # periodically within this leg's tag loop so a large "tags" list can't
+          # outlast the token and cause every subsequent crane call to fail.
+          def refresh_quay_auth():
+              r = subprocess.run(
+                  "echo quay.io | docker-credential-rfcurated get",
+                  shell=True, capture_output=True, text=True,
+              )
+              if r.returncode != 0:
+                  print(f"::warning::quay.io credential refresh failed: {r.stderr.strip()}")
+                  return
+              creds = json.loads(r.stdout)
+              rt = subprocess.run(
+                  ["crane", "auth", "login", "quay.io", "--username", creds["Username"], "--password-stdin"],
+                  input=creds["Secret"], capture_output=True, text=True,
+              )
+              if rt.returncode != 0:
+                  print(f"::warning::crane auth login refresh failed: {rt.stderr.strip()}")
+
+          # Image-name prefix (not a separate ECR repo) disambiguates images that
+          # share one ECR repo — matches the existing IAM/repo scoping, which only
+          # grants push access to the single "rfcurated" repo.
+          slug     = name.replace("/", "-")
+          repo_url = f"{registry}/{ecr_repo}"
+          src_base = f"{source}/{name}"
+          print(f"\n{src_base}")
+
+          refresh_quay_auth()
+
+          # A version-pinned tag (e.g. "3.10.19-jammy-rfcurated") gets dozens of
+          # timestamped rebuild snapshots ("<tag>-20260112T143421", or sometimes
+          # "H" instead of "T"); the bare tag itself may lag behind those. Floating
+          # tags (e.g. "jammy-rfcurated", no version) have no such siblings — they
+          # ARE the current pointer. Resolve once per image: if a listed tag has
+          # timestamped siblings, use the most recent one; otherwise use it as-is.
+          ls = crane("ls", src_base)
+          all_tags = set(ls.stdout.split()) if ls.returncode == 0 else set()
+          if ls.returncode != 0:
+              print(f"::warning::Could not list tags for {src_base} ({ls.stderr.strip()}); using catalogue tags as-is")
+
+          def resolve_latest(base_tag):
+              if not all_tags:
+                  return base_tag
+              pattern = re.compile(rf'^{re.escape(base_tag)}-(\d{{8}})[TH](\d{{6}})$')
+              candidates = []
+              if base_tag in all_tags:
+                  candidates.append(("", base_tag))
+              for t in all_tags:
+                  m = pattern.match(t)
+                  if m:
+                      candidates.append((m.group(1) + m.group(2), t))
+              if not candidates:
+                  return base_tag   # let the digest step below report it as unreachable
+              candidates.sort(key=lambda c: c[0])   # "" (bare tag) sorts before any timestamp
+              return candidates[-1][1]
+
+          for i, tag in enumerate(tags):
+              resolved_tag = resolve_latest(tag)
+              if resolved_tag != tag:
+                  print(f"  {tag} -> resolved to newer snapshot {resolved_tag}")
+              src         = f"{src_base}:{resolved_tag}"
+              dated_dest  = f"{repo_url}:{slug}-{tag}-{datestamp}"
+              latest_tag  = f"{slug}-{tag}-latest"
+              latest_dest = f"{repo_url}:{latest_tag}"
+
+              if i % 10 == 0:   # refresh every 10 tags, not just once per image
+                  refresh_quay_auth()
+
+              r = crane("digest", src)
+              if r.returncode != 0:
+                  print(f"::error::Cannot resolve source digest for {src}: {r.stderr.strip()}")
+                  rows.append(f"| `{src}` | ❌ source unreachable | — |")
+                  failed += 1
+                  continue
+              src_digest = r.stdout.strip()
+
+              # Publish the immutable dated tag only if this exact content isn't
+              # already in the ECR repo.
+              new_content = crane("manifest", f"{repo_url}@{src_digest}").returncode != 0
+              if new_content:
+                  r = crane("copy", "--platform", "all", src, dated_dest)
+                  if r.returncode != 0:
+                      print(f"::error::Copy failed: {src} → {dated_dest}\n{r.stderr.strip()}")
+                      rows.append(f"| `{dated_dest}` | ❌ copy failed | — |")
+                      failed += 1
+                      continue
+
+              # Reconcile the moving "<tag>-latest" pointer INDEPENDENTLY of the
+              # dedup above so it self-heals on later runs. crane tag by digest
+              # re-tags in place — no blob re-upload, multi-arch index preserved.
+              latest_current = crane("digest", latest_dest).stdout.strip()  # "" if absent
+              latest_moved = False
+              if latest_current != src_digest:
+                  rt = crane("tag", f"{repo_url}@{src_digest}", latest_tag)
+                  if rt.returncode != 0:
+                      print(f"::error::Failed to advance {latest_dest}\n{rt.stderr.strip()}")
+                      rows.append(f"| `{latest_dest}` | ❌ -latest advance failed | `{src_digest[:19]}` |")
+                      failed += 1
+                      continue
+                  latest_moved = True
+
+              if new_content:
+                  print(f"  new content ({src_digest[:19]}) → {slug}-{tag}-{datestamp}, {latest_tag}")
+                  rows.append(f"| `{dated_dest}` + `{latest_dest}` | 🔄 new content | `{src_digest[:19]}` |")
+                  copied += 1
+              elif latest_moved:
+                  print(f"  reconciled {latest_tag} → {src_digest[:19]}")
+                  rows.append(f"| `{latest_dest}` | 🩹 -latest reconciled | `{src_digest[:19]}` |")
+                  copied += 1
+              else:
+                  print(f"  up-to-date ({src_digest[:19]})")
+                  rows.append(f"| `{repo_url}:{slug}-{tag}` | ✅ up-to-date | `{src_digest[:19]}` |")
+                  skipped += 1
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              f.write(f"## RapidFort Curated → ECR Image Sync: {name}\n")
+              f.write("| Destination | Status | Digest |\n")
+              f.write("|-------------|--------|--------|\n")
+              f.write("\n".join(rows) + "\n\n")
+              f.write(f"**{copied} copied · {skipped} up-to-date · {failed} failed**\n")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"copied={copied}\nskipped={skipped}\nfailed={failed}\n")
+
+          if failed:
+              print(f"::error::{failed} tag(s) failed to sync for {name}")
+              sys.exit(1)
+          EOF
